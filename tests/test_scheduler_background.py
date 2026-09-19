@@ -1,35 +1,50 @@
 # -*- coding: utf-8 -*-
 """Tests for Scheduler background task support."""
 
+from datetime import datetime
 import sys
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
 
 class _FakeJob:
-    def __init__(self):
-        self.next_run = None
+    def __init__(self, schedule_module):
+        self._schedule_module = schedule_module
+        self.next_run = datetime(2026, 1, 1, 18, 0, 0)
+        self.at_time = None
 
     @property
     def day(self):
         return self
 
-    def at(self, _value):
+    def at(self, value):
+        self.at_time = value
+        hour, minute = [int(part) for part in value.split(":")]
+        self.next_run = datetime(2026, 1, 1, hour, minute, 0)
         return self
 
-    def do(self, _fn):
+    def do(self, fn):
+        self.job_func = fn
+        self._schedule_module.jobs.append(self)
         return self
 
 
 class _FakeScheduleModule:
+    def __init__(self):
+        self.jobs = []
+
     def every(self):
-        return _FakeJob()
+        return _FakeJob(self)
 
     def get_jobs(self):
-        return []
+        return list(self.jobs)
 
     def run_pending(self):
         return None
+
+    def cancel_job(self, job):
+        self.jobs.remove(job)
 
 
 class SchedulerBackgroundTaskTestCase(unittest.TestCase):
@@ -74,8 +89,9 @@ class SchedulerBackgroundTaskTestCase(unittest.TestCase):
             order = []
 
             class FakeScheduler:
-                def __init__(self, schedule_time="18:00"):
+                def __init__(self, schedule_time="18:00", schedule_time_provider=None):
                     order.append(("init", schedule_time))
+                    order.append(("provider", callable(schedule_time_provider)))
 
                 def add_background_task(self, **kwargs):
                     order.append(("background", kwargs["name"]))
@@ -98,7 +114,224 @@ class SchedulerBackgroundTaskTestCase(unittest.TestCase):
                     }],
                 )
 
-        self.assertEqual(order[1:3], [("background", "event_monitor"), ("daily", True)])
+        self.assertEqual(order[:4], [("init", "18:00"), ("provider", False), ("background", "event_monitor"), ("daily", True)])
+
+    def test_scheduler_reloads_daily_job_when_schedule_time_changes(self):
+        fake_schedule = _FakeScheduleModule()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(
+                schedule_time="18:00",
+                schedule_time_provider=lambda: "09:30",
+            )
+            scheduler.set_daily_task(lambda: None, run_immediately=False)
+
+            self.assertEqual(len(fake_schedule.jobs), 1)
+            self.assertEqual(fake_schedule.jobs[0].at_time, "18:00")
+
+            scheduler._refresh_daily_schedule_if_needed()
+
+        self.assertEqual(len(fake_schedule.jobs), 1)
+        self.assertEqual(fake_schedule.jobs[0].at_time, "09:30")
+        self.assertEqual(scheduler.schedule_time, "09:30")
+
+    def test_scheduler_registers_multiple_daily_jobs(self):
+        fake_schedule = _FakeScheduleModule()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(
+                schedule_time="18:00",
+                schedule_times=["15:10", "09:20", "15:10"],
+            )
+            scheduler.set_daily_task(lambda: None, run_immediately=False)
+
+        self.assertEqual([job.at_time for job in fake_schedule.jobs], ["09:20", "15:10"])
+        self.assertEqual(scheduler.schedule_times, ["09:20", "15:10"])
+
+    def test_scheduler_stop_cancels_registered_daily_jobs(self):
+        fake_schedule = _FakeScheduleModule()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(
+                schedule_time="18:00",
+                schedule_times=["09:20", "15:10"],
+            )
+            scheduler.set_daily_task(lambda: None, run_immediately=False)
+            self.assertEqual(len(fake_schedule.jobs), 2)
+
+            scheduler.stop()
+
+        self.assertEqual(fake_schedule.jobs, [])
+        self.assertEqual(scheduler._daily_jobs, [])
+        self.assertIsNone(scheduler._daily_job)
+
+    def test_stop_during_pending_jobs_prevents_new_background_dispatch(self):
+        fake_schedule = _FakeScheduleModule()
+        pending_jobs_entered = threading.Event()
+        release_pending_jobs = threading.Event()
+        background_started = threading.Event()
+
+        def run_pending():
+            pending_jobs_entered.set()
+            release_pending_jobs.wait(timeout=1)
+
+        fake_schedule.run_pending = run_pending
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(schedule_time="18:00")
+            with patch("src.scheduler.time.time", return_value=0):
+                scheduler.add_background_task(
+                    background_started.set,
+                    interval_seconds=30,
+                    run_immediately=False,
+                    name="test",
+                )
+
+            with patch("src.scheduler.time.time", return_value=30), patch(
+                "src.scheduler.time.sleep",
+                return_value=None,
+            ):
+                scheduler_thread = threading.Thread(target=scheduler.run, daemon=True)
+                scheduler_thread.start()
+                self.assertTrue(pending_jobs_entered.wait(timeout=1))
+
+                scheduler.stop()
+                release_pending_jobs.set()
+                scheduler_thread.join(timeout=1)
+
+        self.assertFalse(scheduler_thread.is_alive())
+        self.assertFalse(background_started.wait(timeout=0.1))
+
+    def test_stop_before_run_enters_prevents_scheduler_restart(self):
+        fake_schedule = _FakeScheduleModule()
+        background_started = threading.Event()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(schedule_time="18:00")
+            with patch("src.scheduler.time.time", return_value=0):
+                scheduler.add_background_task(
+                    background_started.set,
+                    interval_seconds=30,
+                    run_immediately=False,
+                    name="test",
+                )
+
+            scheduler.stop()
+
+            def stop_after_pending_jobs():
+                scheduler.shutdown_handler.shutdown_requested = True
+
+            fake_schedule.run_pending = stop_after_pending_jobs
+            with patch("src.scheduler.time.time", return_value=30), patch(
+                "src.scheduler.time.sleep",
+                return_value=None,
+            ):
+                scheduler_thread = threading.Thread(target=scheduler.run, daemon=True)
+                scheduler_thread.start()
+                scheduler_thread.join(timeout=1)
+
+        self.assertFalse(scheduler_thread.is_alive())
+        self.assertFalse(background_started.wait(timeout=0.1))
+
+    def test_shutdown_during_pending_jobs_prevents_new_background_dispatch(self):
+        fake_schedule = _FakeScheduleModule()
+        pending_jobs_entered = threading.Event()
+        release_pending_jobs = threading.Event()
+        background_started = threading.Event()
+
+        def run_pending():
+            pending_jobs_entered.set()
+            release_pending_jobs.wait(timeout=1)
+
+        fake_schedule.run_pending = run_pending
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(schedule_time="18:00", register_signals=False)
+            with patch("src.scheduler.time.time", return_value=0):
+                scheduler.add_background_task(
+                    background_started.set,
+                    interval_seconds=30,
+                    run_immediately=False,
+                    name="test",
+                )
+
+            with patch("src.scheduler.time.time", return_value=30), patch(
+                "src.scheduler.time.sleep",
+                return_value=None,
+            ):
+                scheduler_thread = threading.Thread(target=scheduler.run, daemon=True)
+                scheduler_thread.start()
+                self.assertTrue(pending_jobs_entered.wait(timeout=1))
+
+                scheduler.shutdown_handler.shutdown_requested = True
+                release_pending_jobs.set()
+                scheduler_thread.join(timeout=1)
+
+        self.assertFalse(scheduler_thread.is_alive())
+        self.assertFalse(background_started.wait(timeout=0.1))
+
+    def test_scheduler_keeps_existing_daily_job_when_schedule_time_invalid(self):
+        fake_schedule = _FakeScheduleModule()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(
+                schedule_time="18:00",
+                schedule_time_provider=lambda: "25:99",
+            )
+            scheduler.set_daily_task(lambda: None, run_immediately=False)
+
+            scheduler._refresh_daily_schedule_if_needed()
+
+        self.assertEqual(len(fake_schedule.jobs), 1)
+        self.assertEqual(fake_schedule.jobs[0].at_time, "18:00")
+        self.assertEqual(scheduler.schedule_time, "18:00")
+
+    def test_scheduler_keeps_current_daily_job_when_schedule_time_provider_fails(self):
+        fake_schedule = _FakeScheduleModule()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            provider_calls = {"count": 0}
+
+            def provider():
+                provider_calls["count"] += 1
+                if provider_calls["count"] == 1:
+                    return "09:30"
+                raise RuntimeError("boom")
+
+            scheduler = Scheduler(
+                schedule_time="18:00",
+                schedule_time_provider=provider,
+            )
+            scheduler.set_daily_task(lambda: None, run_immediately=False)
+
+            scheduler._refresh_daily_schedule_if_needed()
+            scheduler._refresh_daily_schedule_if_needed()
+
+        self.assertEqual(len(fake_schedule.jobs), 1)
+        self.assertEqual(fake_schedule.jobs[0].at_time, "09:30")
+        self.assertEqual(scheduler.schedule_time, "09:30")
+
+    def test_scheduler_rejects_invalid_initial_schedule_time(self):
+        fake_schedule = _FakeScheduleModule()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src.scheduler import Scheduler
+
+            scheduler = Scheduler(schedule_time="25:99")
+            calls = []
+
+            with self.assertRaisesRegex(ValueError, "25:99"):
+                scheduler.set_daily_task(lambda: calls.append("ran"), run_immediately=True)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(fake_schedule.jobs, [])
 
 
 if __name__ == "__main__":

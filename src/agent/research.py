@@ -236,7 +236,12 @@ class ResearchAgent:
     def _looks_like_timeout_error(error: Any) -> bool:
         """Best-effort detection for timeout-like failures from lower layers."""
         message = str(error or "").lower()
-        return "timed out" in message or "timeout" in message
+        return (
+            "timed out" in message
+            or "timeout" in message
+            or "insufficient budget" in message
+            or "budget too low" in message
+        )
 
     @staticmethod
     def _build_timeout_result(
@@ -374,7 +379,10 @@ Token budget remaining: ~{remaining_budget}
                 llm_adapter=self.llm_adapter,
                 max_steps=4,
                 max_wall_clock_seconds=timeout_seconds,
-                tool_call_timeout_seconds=timeout_seconds,
+                # NOTE: do not pass tool_call_timeout_seconds here — under the
+                # first-wins contract it would override the per-tool / category
+                # limits, letting one tool consume the whole sub-question budget.
+                # The remaining wall-clock budget alone keeps tools bounded.
             )
             if not result.success and self._looks_like_timeout_error(result.error):
                 return {
